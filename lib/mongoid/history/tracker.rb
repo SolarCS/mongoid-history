@@ -20,8 +20,8 @@ module Mongoid
         modifier_options[:optional] = true if Mongoid::Compatibility::Version.mongoid6_or_newer?
         belongs_to :modifier, modifier_options
 
-        index(scope: 1)
-        index(association_chain: 1)
+        index({ scope: 1 })
+        index({ association_chain: 1 })
 
         Mongoid::History.tracker_class_name ||= name.tableize.singularize.to_sym
       end
