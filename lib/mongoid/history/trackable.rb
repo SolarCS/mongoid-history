@@ -25,9 +25,28 @@ module Mongoid
           delegate :track_history?, to: 'self.class'
 
           callback_options = history_options.options.slice(:if, :unless)
-          around_update :track_update, **callback_options if history_options.options[:track_update]
-          around_create :track_create, **callback_options if history_options.options[:track_create]
-          around_destroy :track_destroy, **callback_options if history_options.options[:track_destroy]
+
+          # Mongoid 10 removes support for around callbacks on embedded
+          # documents. Instead of registering around_* callbacks we now hook
+          # into before_/after_* callbacks and delegate to the original
+          # tracking methods. This keeps the public API and most of the
+          # behaviour intact while avoiding unsupported callbacks on embedded
+          # docs.
+
+          if history_options.options[:track_update]
+            before_update :mongoid_history_before_update, **callback_options
+            after_update  :mongoid_history_after_update,  **callback_options
+          end
+
+          if history_options.options[:track_create]
+            before_create :mongoid_history_before_create, **callback_options
+            after_create  :mongoid_history_after_create,  **callback_options
+          end
+
+          if history_options.options[:track_destroy]
+            before_destroy :mongoid_history_before_destroy, **callback_options
+            after_destroy  :mongoid_history_after_destroy,  **callback_options
+          end
 
           unless respond_to? :mongoid_history_options
             class_attribute :mongoid_history_options, instance_accessor: false
@@ -258,16 +277,28 @@ module Mongoid
           @history_tracker_attributes
         end
 
-        def track_create(&block)
-          track_history_for_action(:create, &block)
+        # NOTE: Historically, tracking used around_* callbacks that wrapped the
+        # persistence operation and pre-created the tracker document. Mongoid 10
+        # removes support for around callbacks on embedded documents, so we now
+        # invoke the same tracking methods from after_* callbacks instead.
+
+        def track_create
+          mongoid_history_prepare_for(:create)
+          mongoid_history_create_track
         end
 
-        def track_update(&block)
-          track_history_for_action(:update, &block)
+        def track_update
+          mongoid_history_prepare_for(:update)
+          mongoid_history_create_track
         end
 
-        def track_destroy(&block)
-          track_history_for_action(:destroy, &block) unless destroyed?
+        def track_destroy
+          # Legacy entry point used by specs and any external callers expecting
+          # a track_destroy method. The real destroy tracking for callbacks is
+          # handled by mongoid_history_before_destroy/after_destroy to preserve
+          # access to the document state before it is destroyed.
+          mongoid_history_prepare_for(:destroy)
+          mongoid_history_create_track
         end
 
         def clear_trackable_memoization
@@ -329,26 +360,78 @@ module Mongoid
           action != :destroy && !ancestor_flagged_for_destroy?(_parent)
         end
 
-        def track_history_for_action(action)
-          if track_history_for_action?(action)
-            current_version = increment_current_version?(action) ? increment_current_version : next_version
-            last_track = self.class.tracker_class.create!(
-              history_tracker_attributes(action.to_sym)
-              .merge(version: current_version, action: action.to_s, trackable: self)
+  # Prepare data required to create a history tracker for the given
+  # action. This is invoked from before_* callbacks (or directly from
+  # track_* methods when used imperatively).
+        def mongoid_history_prepare_for(action)
+          return unless track_history_for_action?(action)
+
+          @mongoid_history_action = action.to_sym
+          @mongoid_history_current_version =
+            increment_current_version?(action) ? increment_current_version : next_version
+          @mongoid_history_attributes =
+            history_tracker_attributes(action.to_sym).merge(
+              version: @mongoid_history_current_version,
+              action: action.to_s,
+              trackable: self
             )
-          end
+        end
 
+        # Create the history tracker using data captured in
+        # mongoid_history_prepare_for. This is invoked from after_* callbacks,
+        # or directly from track_* methods, and should only run when the
+        # operation has succeeded.
+        def mongoid_history_create_track
+          return unless defined?(@mongoid_history_action) && @mongoid_history_action
+
+          self.class.tracker_class.create!(@mongoid_history_attributes)
+        ensure
           clear_trackable_memoization
+          @mongoid_history_action = nil
+          @mongoid_history_current_version = nil
+          @mongoid_history_attributes = nil
+        end
 
-          begin
-            yield
-          rescue => e
-            if track_history_for_action?(action)
-              send("#{history_trackable_options[:version_field]}=", current_version - 1)
-              last_track.destroy
-            end
-            raise e
-          end
+        # Backwards-compatible entry point used by legacy code paths. This is
+        # no longer used as an around-callback, but remains available for
+        # callers that expect to wrap a block and record history for the given
+        # action.
+        def track_history_for_action(action)
+          mongoid_history_prepare_for(action)
+          yield if block_given?
+          mongoid_history_create_track
+        end
+
+        # Destroy tracking is special because we need access to the document
+        # state before it is removed from the database. We therefore prepare
+        # the attributes in a before_destroy callback and create the tracker in
+        # after_destroy.
+
+        def mongoid_history_before_destroy
+          # If the document is already destroyed/marked as such, skip.
+          return if destroyed?
+
+          mongoid_history_prepare_for(:destroy)
+        end
+
+        def mongoid_history_after_destroy
+          mongoid_history_create_track
+        end
+
+        def mongoid_history_before_update
+          mongoid_history_prepare_for(:update)
+        end
+
+        def mongoid_history_after_update
+          mongoid_history_create_track
+        end
+
+        def mongoid_history_before_create
+          mongoid_history_prepare_for(:create)
+        end
+
+        def mongoid_history_after_create
+          mongoid_history_create_track
         end
       end
 

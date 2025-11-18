@@ -1,3 +1,4 @@
+require 'logger'
 require 'coveralls'
 Coveralls.wear!
 
